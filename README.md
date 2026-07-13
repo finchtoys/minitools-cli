@@ -1,6 +1,6 @@
 # @finchtoys/minitools
 
-The official CLI for installing and managing Finch extensions.
+The official CLI for installing and managing Finch minitools.
 
 ## Installation
 
@@ -13,24 +13,24 @@ npx @finchtoys/minitools add <package>
 ## Usage
 
 ```bash
-# Install an extension from npm
+# Install an mini tool from npm
 npx @finchtoys/minitools add @scope/my-finch-extension
 
-# List installed extensions
+# List installed mini tool extensions
 npx @finchtoys/minitools list
 
-# Update an extension
+# Update an mini tools
 npx @finchtoys/minitools update my-extension
 
-# Enable or disable an extension
+# Enable or disable an mini tool
 npx @finchtoys/minitools enable my-extension
 npx @finchtoys/minitools disable my-extension
 
-# Diagnose the local extension environment
+# Diagnose the local mini tool environment
 npx @finchtoys/minitools doctor
 ```
 
-Extensions add agent tools, MCP integrations, and native UI capabilities to Finch. See the [Finch documentation](https://finchwork.app/docs/extensions) to build an extension.
+Mini tools add agent tools, MCP integrations, and native UI capabilities to Finch. See the [Finch documentation](https://finchwork.app/en/docs/minitools) to build an mini tool (extension）.
 
 ## License
 
