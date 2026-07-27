@@ -210,6 +210,15 @@ function validateContributes(contributes, diagnostics) {
         validateStringField(container.icon, `${prefix}.icon`, diagnostics);
         validateStringField(container.title, `${prefix}.title`, diagnostics, { localized: true });
         validateStringField(container.description, `${prefix}.description`, diagnostics, { localized: true });
+        if (container.mode != null && container.mode !== 'inbox' && container.mode !== 'assistant') {
+          diagnostics.warning.push(`${prefix}.mode 应为 'inbox' 或 'assistant'`);
+        }
+        if (container.agentProfile != null && (typeof container.agentProfile !== 'string' || !container.agentProfile.trim())) {
+          diagnostics.warning.push(`${prefix}.agentProfile 应为字符串`);
+        }
+        if (container.mode === 'assistant' && !container.agentProfile) {
+          diagnostics.warning.push(`${prefix}: assistant 模式需要声明 agentProfile`);
+        }
         if (container.starterPrompts != null) {
           if (!Array.isArray(container.starterPrompts)) {
             diagnostics.warning.push(`${prefix}.starterPrompts 应为数组`);
