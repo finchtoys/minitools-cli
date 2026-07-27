@@ -194,13 +194,67 @@ function validateContributes(contributes, diagnostics) {
   if (contributes.mcpServers != null && !Array.isArray(contributes.mcpServers)) {
     diagnostics.fatal.push('finch.contributes.mcpServers 必须是数组');
   }
+  if (contributes.sessionContainers != null) {
+    if (!Array.isArray(contributes.sessionContainers)) {
+      diagnostics.fatal.push('finch.contributes.sessionContainers 必须是数组');
+    } else {
+      for (const [index, container] of contributes.sessionContainers.entries()) {
+        const prefix = `finch.contributes.sessionContainers[${index}]`;
+        if (!container || typeof container !== 'object' || Array.isArray(container)) {
+          diagnostics.fatal.push(`${prefix} 必须是对象`);
+          continue;
+        }
+        if (typeof container.id !== 'string' || !container.id.trim()) {
+          diagnostics.fatal.push(`${prefix}.id 缺失或不是字符串`);
+        }
+        validateStringField(container.icon, `${prefix}.icon`, diagnostics);
+        validateStringField(container.title, `${prefix}.title`, diagnostics, { localized: true });
+        validateStringField(container.description, `${prefix}.description`, diagnostics, { localized: true });
+        if (container.starterPrompts != null) {
+          if (!Array.isArray(container.starterPrompts)) {
+            diagnostics.warning.push(`${prefix}.starterPrompts 应为数组`);
+          } else {
+            for (const [si, starter] of container.starterPrompts.entries()) {
+              const sp = `${prefix}.starterPrompts[${si}]`;
+              if (!starter || typeof starter !== 'object' || Array.isArray(starter)) {
+                diagnostics.warning.push(`${sp} 应为对象`);
+                continue;
+              }
+              validateStringField(starter.title, `${sp}.title`, diagnostics, { localized: true, required: true });
+              validateStringField(starter.description, `${sp}.description`, diagnostics, { localized: true });
+              validateStringField(starter.prompt, `${sp}.prompt`, diagnostics, { localized: true, required: true });
+            }
+          }
+        }
+      }
+    }
+  }
+  if (contributes.agentProfiles != null) {
+    if (!Array.isArray(contributes.agentProfiles)) {
+      diagnostics.fatal.push('finch.contributes.agentProfiles 必须是数组');
+    } else {
+      for (const [index, profile] of contributes.agentProfiles.entries()) {
+        const prefix = `finch.contributes.agentProfiles[${index}]`;
+        if (!profile || typeof profile !== 'object' || Array.isArray(profile)) {
+          diagnostics.fatal.push(`${prefix} 必须是对象`);
+          continue;
+        }
+        if (typeof profile.id !== 'string' || !profile.id.trim()) {
+          diagnostics.fatal.push(`${prefix}.id 缺失或不是字符串`);
+        }
+        validateStringField(profile.name, `${prefix}.name`, diagnostics, { localized: true });
+        validateStringField(profile.description, `${prefix}.description`, diagnostics, { localized: true });
+        validateStringField(profile.prompt, `${prefix}.prompt`, diagnostics, { localized: true, required: true });
+      }
+    }
+  }
 }
 
 function validatePermissions(permissions, diagnostics) {
   if (permissions == null) return;
   if (!validateObject(permissions, 'finch.permissions', diagnostics)) return;
-  if (permissions.filesystem != null && !['none', 'read', 'write'].includes(permissions.filesystem)) {
-    diagnostics.warning.push('finch.permissions.filesystem 建议使用 none/read/write');
+  if (permissions.filesystem != null && !['none', 'read', 'readwrite'].includes(permissions.filesystem)) {
+    diagnostics.warning.push('finch.permissions.filesystem 建议使用 none/read/readwrite');
   }
   if (permissions.network != null && typeof permissions.network !== 'boolean') {
     diagnostics.warning.push('finch.permissions.network 应为 boolean');
@@ -208,6 +262,11 @@ function validatePermissions(permissions, diagnostics) {
   if (permissions.shell != null && typeof permissions.shell !== 'boolean') {
     diagnostics.warning.push('finch.permissions.shell 应为 boolean');
   }
+  if (permissions.sessions != null && typeof permissions.sessions !== 'boolean') {
+    diagnostics.warning.push('finch.permissions.sessions 应为 boolean');
+  }
+  validateStringArray(permissions.secrets, 'finch.permissions.secrets', diagnostics);
+  validateStringArray(permissions.oauth, 'finch.permissions.oauth', diagnostics);
 }
 
 function validateCapabilitySpec(spec, field, diagnostics) {
@@ -219,22 +278,49 @@ function validateCapabilitySpec(spec, field, diagnostics) {
 function validateMiniToolPackage(dir, { lintSource = false } = {}) {
   const diagnostics = { fatal: [], warning: [] };
   const pkg = readPackageJson(dir);
-  if (!pkg) {
-    diagnostics.fatal.push('缺少 package.json，或 package.json 不是合法 JSON');
-    return { diagnostics, info: null };
+
+  // finch.json takes priority over package.json#finch.
+  // The file IS the manifest directly (no `finch` wrapper key).
+  const finchJsonPath = join(dir, 'finch.json');
+  let manifest;
+  let manifestSource;
+  if (existsSync(finchJsonPath)) {
+    manifest = readJson(finchJsonPath, null);
+    manifestSource = 'finch.json';
+    if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest)) {
+      diagnostics.fatal.push('finch.json 不是合法 JSON 对象');
+      return { diagnostics, info: null };
+    }
+    // Inherit npm fields from package.json when finch.json omits them
+    if (pkg) {
+      manifest = {
+        ...manifest,
+        id: manifest.id ?? pkg.name,
+        name: manifest.name ?? manifest.displayName ?? pkg.name,
+        displayName: manifest.displayName ?? manifest.name,
+        main: manifest.main ?? pkg.main,
+        description: manifest.description ?? pkg.description,
+      };
+    }
+  } else {
+    manifest = pkg?.finch ?? null;
+    manifestSource = 'package.json#finch';
+    if (!pkg) {
+      diagnostics.fatal.push('缺少 package.json');
+      return { diagnostics, info: null };
+    }
   }
 
-  const manifest = pkg.finch;
   if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest)) {
-    diagnostics.fatal.push('缺少 package.json#finch，或 finch manifest 不是对象');
+    diagnostics.fatal.push(`缺少 ${manifestSource}，或 manifest 不是对象`);
     return { diagnostics, info: null };
   }
 
-  const id = String(manifest.id ?? pkg.name ?? '').trim();
+  const id = String(manifest.id ?? pkg?.name ?? '').trim();
   if (!id) {
-    diagnostics.fatal.push('package.json#finch 缺少 id');
+    diagnostics.fatal.push(`${manifestSource} 缺少 id`);
   } else if (!EXTENSION_ID_RE.test(id) || id === '.' || id === '..') {
-    diagnostics.fatal.push(`package.json#finch.id 不合法: ${id}（只能使用字母、数字、点、下划线、短横线，且不能包含路径分隔符）`);
+    diagnostics.fatal.push(`${manifestSource}.id 不合法: ${id}（只能使用字母、数字、点、下划线、短横线，且不能包含路径分隔符）`);
   }
 
   if (manifest.manifestVersion !== undefined && manifest.manifestVersion !== SUPPORTED_MANIFEST_VERSION) {
@@ -266,7 +352,7 @@ function validateMiniToolPackage(dir, { lintSource = false } = {}) {
   validateCapabilitySpec(manifest.requires, 'finch.requires', diagnostics);
   validateContributes(manifest.contributes, diagnostics);
 
-  const mainValue = manifest.main ?? pkg.main ?? 'dist/index.js';
+  const mainValue = manifest.main ?? pkg?.main ?? 'dist/index.js';
   if (typeof mainValue !== 'string' || !mainValue.trim()) {
     diagnostics.fatal.push('入口 main 必须是非空字符串（finch.main 或 package.json#main）');
   }
@@ -283,13 +369,13 @@ function validateMiniToolPackage(dir, { lintSource = false } = {}) {
   if (lintSource) diagnostics.warning.push(...lintExtensionSource(dir));
 
   const nameField = manifest.name ?? manifest.displayName;
-  const displayName = localizedValue(nameField, pkg.name ?? id).trim() || id;
+  const displayName = localizedValue(nameField, pkg?.name ?? id).trim() || id;
   return {
     diagnostics,
     info: {
       id,
-      name: pkg.name ?? id,
-      version: pkg.version ?? '0.0.0',
+      name: pkg?.name ?? id,
+      version: pkg?.version ?? '0.0.0',
       displayName,
       main,
     },
@@ -800,7 +886,10 @@ function cmdDoctor(src = '.') {
   }
 
   const pkg = readPackageJson(abs);
-  const manifest = pkg?.finch ?? {};
+  const finchJsonPath = join(abs, 'finch.json');
+  const manifest = existsSync(finchJsonPath)
+    ? readJson(finchJsonPath, {})
+    : (pkg?.finch ?? {});
   if (manifest.permissions && typeof manifest.permissions === 'object') {
     const p = manifest.permissions;
     const decl = [
