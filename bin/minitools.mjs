@@ -18,6 +18,7 @@ const LOCK_FILE = '.plugins-lock.json';
 const SUPPORTED_MANIFEST_VERSION = 1;
 const EXTENSION_ID_RE = /^[a-zA-Z0-9][a-zA-Z0-9._-]*$/;
 const KNOWN_EXTENSION_TYPES = new Set(['official', 'community', 'local']);
+const SEMVER_PATTERN = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
 const LEGACY_NPM_PACKAGE_RENAMES = new Map([
   ['@finchtoys/mcp-bridge', '@finchtoys/mcp-client'],
 ]);
@@ -39,13 +40,15 @@ function workspaceStatePath() {
 }
 function configuredAgentHome() {
   const state = readJson(workspaceStatePath(), {});
-  const configured = typeof state.finchHomeDir === 'string' && state.finchHomeDir.trim()
-    ? state.finchHomeDir.trim()
-    : join(homedir(), 'finchnest');
+  const configured = typeof process.env.FINCH_AGENT_HOME === 'string' && process.env.FINCH_AGENT_HOME.trim()
+    ? process.env.FINCH_AGENT_HOME.trim()
+    : typeof state.finchHomeDir === 'string' && state.finchHomeDir.trim()
+      ? state.finchHomeDir.trim()
+      : join(homedir(), basename(finchRuntimeHome()) === '.finch-dev' ? 'finchnest-dev' : 'finchnest');
   return resolve(expandHomePath(configured));
 }
 function globalPluginsDir() {
-  return join(homedir(), '.finch', 'extensions');
+  return join(finchRuntimeHome(), 'extensions');
 }
 function personalPluginsDir() {
   return join(configuredAgentHome(), '.finch', 'extensions');
@@ -334,6 +337,13 @@ function validateMiniToolPackage(dir, { lintSource = false } = {}) {
 
   if (manifest.manifestVersion !== undefined && manifest.manifestVersion !== SUPPORTED_MANIFEST_VERSION) {
     diagnostics.fatal.push(`不支持的 manifestVersion: ${manifest.manifestVersion}（当前 Finch 支持 ${SUPPORTED_MANIFEST_VERSION}）`);
+  }
+
+  if (manifest.minVersion !== undefined && (
+    typeof manifest.minVersion !== 'string'
+    || !SEMVER_PATTERN.test(manifest.minVersion.trim())
+  )) {
+    diagnostics.fatal.push('finch.minVersion 必须是完整的 SemVer 版本（例如 1.6.0），不支持版本范围');
   }
 
   validateStringField(manifest.name, 'finch.name', diagnostics, { localized: true });
@@ -1011,7 +1021,7 @@ function parseArgs(argv) {
 }
 
 function help() {
-  console.log(`npx @finchtoys/minitools\n\nUsage:\n  add <npm-package|local-path|url.zip|url.tgz> [--global] [--registry <url>]\n  update <id> [--global] [--registry <url>]\n  list [--global]\n  remove <id> [--global]\n  enable <id>\n  disable <id>\n  where\n  doctor [path]\n\nInstall locations:\n  default     workspace.json#finchHomeDir/.finch/extensions/  (personal — default)\n  --global   ~/.finch/extensions/                              (global)\n\nRegistry:\n  --registry <url> overrides npm registry for npm package metadata/tarball downloads.\n  If omitted, npm_config_registry is used, then https://registry.npmjs.org.\n\nThere is no project/--cwd scope — extensions only install to personal or global.\n`);
+  console.log(`npx @finchtoys/minitools\n\nUsage:\n  add <npm-package|local-path|url.zip|url.tgz> [--global] [--registry <url>]\n  update <id> [--global] [--registry <url>]\n  list [--global]\n  remove <id> [--global]\n  enable <id>\n  disable <id>\n  where\n  doctor [path]\n\nInstall locations:\n  default     workspace.json#finchHomeDir/.finch/extensions/  (personal — default)\n  --global   FINCH_RUNTIME_HOME/extensions/                    (global; default ~/.finch/extensions/)\n\nRegistry:\n  --registry <url> overrides npm registry for npm package metadata/tarball downloads.\n  If omitted, npm_config_registry is used, then https://registry.npmjs.org.\n\nThere is no project/--cwd scope — extensions only install to personal or global.\n`);
 }
 
 (async () => {
