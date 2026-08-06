@@ -438,14 +438,47 @@ function findPluginDirs(root, maxDepth = 4) {
   return found;
 }
 
-function installExtensionDir(srcDir, destRoot, lockSource) {
+/**
+ * Files Finch owns inside an installed extension directory. They are runtime
+ * state, not package content, so a clean re-install must carry them across
+ * instead of letting the incoming package wipe them.
+ */
+const PRESERVED_INSTALL_FILES = ['.enabled'];
+
+/**
+ * Replace `dest` with `srcDir`, rather than merging on top of it.
+ *
+ * A merge copy (`cpSync` with `force`) leaves behind every file the new version
+ * deleted — stale `dist/*.js` chunks, and worst of all a stale `node_modules/`
+ * from a version that used to ship dependencies. That produces an extension
+ * whose package.json says v2 while half its code on disk is still v1. So: stash
+ * Finch's own state files, wipe the directory, copy, restore the state files.
+ */
+function replaceExtensionDir(srcDir, dest) {
+  const preserved = [];
+  for (const name of PRESERVED_INSTALL_FILES) {
+    const path = join(dest, name);
+    if (!existsSync(path)) continue;
+    try { preserved.push([name, readFileSync(path)]); } catch { /* unreadable → drop it */ }
+  }
+  rmSync(dest, { recursive: true, force: true });
+  cpSync(srcDir, dest, { recursive: true, force: true, dereference: false });
+  for (const [name, contents] of preserved) {
+    try { writeFileSync(join(dest, name), contents); } catch { /* best effort */ }
+  }
+}
+
+function installExtensionDir(srcDir, destRoot, lockSource, { quiet = false } = {}) {
   const info = pluginInfo(srcDir);
   if (!info) throw new Error(`不是 Finch 扩展: ${srcDir}`);
   if (info.error) throw new Error(info.error);
   mkdirSync(destRoot, { recursive: true });
   const dest = join(destRoot, info.id);
-  cpSync(srcDir, dest, { recursive: true, force: true, dereference: false });
+  replaceExtensionDir(srcDir, dest);
   recordInstall(destRoot, info.id, lockSource);
+  // `update` reports its own before/after summary, so stay quiet there rather
+  // than telling the user to go enable an extension they already enabled.
+  if (quiet) return info.id;
   console.log(`✓ Added "${info.displayName}" (${info.id}) → ${dest}`);
   console.log('  Installed only. Open Finch → Toolcase → Mini Tools to review permissions and enable.');
   return info.id;
@@ -655,7 +688,7 @@ async function resolveNpmTarball(spec) {
  * Install extensions from a zip file (local path or remote URL).
  * The zip may contain one or more extensions at any nesting level.
  */
-async function installFromZip(src, dest, isUrl) {
+async function installFromZip(src, dest, isUrl, { quiet = false } = {}) {
   const tmp = join(tmpdir(), `finch-ext-${randomUUID()}`);
   const zipPath = join(tmp, 'extension.zip');
   const extractDir = join(tmp, 'extracted');
@@ -680,13 +713,13 @@ async function installFromZip(src, dest, isUrl) {
     const lockSource = isUrl
       ? { type: 'zip', url: src }
       : { type: 'zip', localPath: resolve(expandHome(src)) };
-    for (const dir of found) installExtensionDir(dir, dest, lockSource);
+    for (const dir of found) installExtensionDir(dir, dest, lockSource, { quiet });
   } finally {
     try { rmSync(tmp, { recursive: true, force: true }); } catch { /* ignore */ }
   }
 }
 
-async function installFromTgz(src, dest, { isUrl, lockSource }) {
+async function installFromTgz(src, dest, { isUrl, lockSource, quiet = false }) {
   const tmp = join(tmpdir(), `finch-ext-${randomUUID()}`);
   const tgzPath = join(tmp, 'extension.tgz');
   const extractDir = join(tmp, 'extracted');
@@ -710,7 +743,7 @@ async function installFromTgz(src, dest, { isUrl, lockSource }) {
     const source = lockSource ?? (isUrl
       ? { type: 'tgz', url: src }
       : { type: 'tgz', localPath: resolve(expandHome(src)) });
-    for (const dir of found) installExtensionDir(dir, dest, source);
+    for (const dir of found) installExtensionDir(dir, dest, source, { quiet });
   } finally {
     try { rmSync(tmp, { recursive: true, force: true }); } catch { /* ignore */ }
   }
@@ -935,66 +968,152 @@ function cmdDoctor(src = '.') {
   }
 }
 
+/** Compare two semver-ish strings. 1 if a > b, -1 if a < b, 0 if equal. */
+function compareSemver(a, b) {
+  const parse = (v) => String(v ?? '0').replace(/^v/, '').split('-')[0].split('.').map((n) => parseInt(n, 10) || 0);
+  const pa = parse(a);
+  const pb = parse(b);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i += 1) {
+    const da = pa[i] ?? 0;
+    const db = pb[i] ?? 0;
+    if (da > db) return 1;
+    if (da < db) return -1;
+  }
+  return 0;
+}
+
+function installedVersionOf(dir) {
+  const pkg = readPackageJson(dir);
+  return typeof pkg?.version === 'string' ? pkg.version : null;
+}
+
+function npmPackageNameOf(dir) {
+  const pkg = readPackageJson(dir);
+  const name = typeof pkg?.name === 'string' ? pkg.name.trim() : '';
+  return name || null;
+}
+
+/**
+ * Ask the registry for the newest published version. Returns null when the
+ * extension has no npm identity or the registry is unreachable — callers treat
+ * that as "no npm candidate" and fall back to the recorded install source.
+ */
+async function resolveNpmCandidate(packageName) {
+  if (!packageName) return null;
+  try {
+    return await resolveNpmTarball(packageName);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Decide where an update should actually come from.
+ *
+ * The update *badge* in Finch is computed purely from the npm registry, but the
+ * update *action* used to follow `.plugins-lock.json` blindly. When a tool was
+ * ever installed from a local folder or a pinned zip/tgz URL, that record wins
+ * forever: the CLI re-copies the same old bits, exits 0, and Finch reports
+ * success while the version never moves.
+ *
+ * So npm wins whenever it is strictly newer than what is installed. Otherwise
+ * we keep honouring the recorded source, which preserves the local-folder
+ * "re-sync after rebuild" workflow extension authors rely on.
+ */
+async function resolveUpdateSource(id, dir, target, recorded) {
+  const installedVersion = installedVersionOf(target);
+  const npmCandidate = await resolveNpmCandidate(npmPackageNameOf(target));
+  const npmIsNewer = Boolean(
+    npmCandidate && installedVersion && compareSemver(npmCandidate.version, installedVersion) > 0,
+  );
+
+  if (!recorded) {
+    // No install record — bundled first-party extensions are deployed by copying,
+    // not via `add`. The npm name in package.json is the only handle we have.
+    if (npmCandidate) return { kind: 'npm', candidate: npmCandidate };
+    throw new Error(`no install record for "${id}"; reinstall it with \`add\` to enable updates.`);
+  }
+
+  if (recorded.type === 'local') {
+    const localPath = recorded.localPath ? expandHome(recorded.localPath) : '';
+    const localInfo = localPath && existsSync(localPath) ? pluginInfo(localPath) : null;
+    const localUsable = Boolean(localInfo && !localInfo.error);
+    const localBeatsNpm = localUsable && npmCandidate
+      && compareSemver(localInfo.version, npmCandidate.version) >= 0;
+    if (localUsable && (!npmIsNewer || localBeatsNpm)) {
+      return { kind: 'local', localPath, info: localInfo, source: recorded };
+    }
+    if (npmCandidate) {
+      if (!localUsable) {
+        console.log(`  Local source unavailable (${recorded.localPath ?? 'unknown'}) — updating from npm instead.`);
+      } else {
+        console.log(`  Local source is v${localInfo.version}; npm has v${npmCandidate.version} — updating from npm instead.`);
+      }
+      return { kind: 'npm', candidate: npmCandidate };
+    }
+    if (!localUsable) {
+      throw new Error(localInfo?.error ?? `local source no longer exists: ${recorded.localPath ?? '(unknown)'}`);
+    }
+    return { kind: 'local', localPath, info: localInfo, source: recorded };
+  }
+
+  if (recorded.type === 'zip' || recorded.type === 'tgz') {
+    // Archive records pin one fixed URL/path, so they can never deliver a newer
+    // release on their own. Prefer npm the moment it has something newer.
+    if (npmIsNewer && npmCandidate) {
+      console.log(`  Recorded ${recorded.type} source is pinned; npm has v${npmCandidate.version} — updating from npm instead.`);
+      return { kind: 'npm', candidate: npmCandidate };
+    }
+    return { kind: recorded.type, source: recorded };
+  }
+
+  const candidate = npmCandidate ?? await resolveNpmTarball(recorded.package ?? id);
+  return { kind: 'npm', candidate };
+}
+
 async function cmdUpdate(id, opts) {
   const dir = targetDir(opts);
   const target = join(dir, id);
   if (!existsSync(target)) throw new Error(`extension not found: ${id}`);
-  let source = normalizeInstallSource(readLock(dir)[id]);
-  if (!source) {
-    // No install record — this happens for bundled first-party extensions that
-    // were deployed by copying (e.g. the MCP bridge), not via `add`. Fall back to
-    // the installed package.json's npm name so they can still be updated from the
-    // registry. recordInstall below then writes a proper lock entry.
-    const pkg = readPackageJson(target);
-    const pkgName = typeof pkg?.name === 'string' ? pkg.name.trim() : '';
-    if (pkgName) {
-      source = normalizeInstallSource({ type: 'npm', package: pkgName });
-    } else {
-      throw new Error(`no install record for "${id}"; reinstall it with \`add\` to enable updates.`);
-    }
+
+  const before = installedVersionOf(target);
+  const recorded = normalizeInstallSource(readLock(dir)[id]);
+  const plan = await resolveUpdateSource(id, dir, target, recorded);
+
+  if (plan.kind === 'local') {
+    replaceExtensionDir(plan.localPath, target);
+    recordInstall(dir, id, plan.source);
+  } else if (plan.kind === 'zip') {
+    if (plan.source.url) await installFromZip(plan.source.url, dir, true, { quiet: true });
+    else if (plan.source.localPath) await installFromZip(plan.source.localPath, dir, false, { quiet: true });
+    else throw new Error(`zip install record for "${id}" has no url or localPath; reinstall with \`add\`.`);
+  } else if (plan.kind === 'tgz') {
+    if (plan.source.url) await installFromTgz(plan.source.url, dir, { isUrl: true, lockSource: plan.source, quiet: true });
+    else if (plan.source.localPath) await installFromTgz(plan.source.localPath, dir, { isUrl: false, lockSource: plan.source, quiet: true });
+    else throw new Error(`tgz install record for "${id}" has no url or localPath; reinstall with \`add\`.`);
+  } else {
+    await installFromTgz(plan.candidate.tarball, dir, {
+      isUrl: true,
+      lockSource: { type: 'npm', package: plan.candidate.package, version: plan.candidate.version },
+      quiet: true,
+    });
   }
 
-  if (source.type === 'local') {
-    const localPath = source.localPath ? expandHome(source.localPath) : '';
-    if (!localPath || !existsSync(localPath)) {
-      throw new Error(`local source no longer exists: ${source.localPath ?? '(unknown)'}`);
-    }
-    const info = pluginInfo(localPath);
-    if (!info || info.error) throw new Error(info?.error ?? `not a Finch extension: ${localPath}`);
-    cpSync(localPath, target, { recursive: true, force: true, dereference: false });
-    recordInstall(dir, id, source);
-    console.log(`✓ Updated "${info.displayName}" (${id}) from local path`);
-    return;
-  }
-
-  // zip/tgz source: re-download / re-extract from the recorded URL or local path.
-  if (source.type === 'zip') {
-    if (source.url) {
-      await installFromZip(source.url, dir, true);
-    } else if (source.localPath) {
-      await installFromZip(source.localPath, dir, false);
-    } else {
-      throw new Error(`zip install record for "${id}" has no url or localPath; reinstall with \`add\`.`);
-    }
-    return;
-  }
-  if (source.type === 'tgz') {
-    if (source.url) {
-      await installFromTgz(source.url, dir, { isUrl: true, lockSource: source });
-    } else if (source.localPath) {
-      await installFromTgz(source.localPath, dir, { isUrl: false, lockSource: source });
-    } else {
-      throw new Error(`tgz install record for "${id}" has no url or localPath; reinstall with \`add\`.`);
-    }
-    return;
-  }
-
-  // npm source: reinstall the latest published version by downloading dist.tarball directly.
-  const resolved = await resolveNpmTarball(source.package ?? id);
-  await installFromTgz(resolved.tarball, dir, {
-    isUrl: true,
-    lockSource: { type: 'npm', package: resolved.package, version: resolved.version },
-  });
+  // Report what actually landed on disk. Exit code 0 alone used to be read as
+  // "updated", which is how a no-op copy became a success toast in Finch.
+  const after = installedVersionOf(target);
+  const info = pluginInfo(target);
+  const displayName = (info && !info.error && info.displayName) || id;
+  const changed = Boolean(before && after && compareSemver(after, before) !== 0);
+  if (changed) console.log(`✓ Updated "${displayName}" (${id}) v${before} → v${after}`);
+  else console.log(`• "${displayName}" (${id}) is already up to date (v${after ?? before ?? 'unknown'})`);
+  console.log(`FINCH_CLI_RESULT_JSON:${JSON.stringify({
+    id,
+    changed,
+    previousVersion: before,
+    version: after,
+    source: plan.kind,
+  })}`);
 }
 
 function parseArgs(argv) {
