@@ -17,6 +17,16 @@ import { randomUUID } from 'node:crypto';
 const LOCK_FILE = '.plugins-lock.json';
 const SUPPORTED_MANIFEST_VERSION = 1;
 const EXTENSION_ID_RE = /^[a-zA-Z0-9][a-zA-Z0-9._-]*$/;
+/**
+ * Sentinel file written into every extension installed by `add`/`update`,
+ * recording the npm-package-derived id Finch should use for it. Presence of
+ * this file is what tells scanner.ts (the app's live manifest reader) "this
+ * install opted into the package-name id policy" — extensions installed
+ * before this existed have no sentinel and keep resolving their id the old
+ * way (`finch.id` ?? package name), so nothing already on disk breaks.
+ * See PRESERVED_INSTALL_FILES: it survives `update` re-copies.
+ */
+const INSTALL_ID_SENTINEL_FILE = '.finch-id';
 const KNOWN_EXTENSION_TYPES = new Set(['official', 'community', 'local']);
 const SEMVER_PATTERN = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
 const LEGACY_NPM_PACKAGE_RENAMES = new Map([
@@ -397,6 +407,7 @@ function validateMiniToolPackage(dir, { lintSource = false } = {}) {
       version: pkg?.version ?? '0.0.0',
       displayName,
       main,
+      extensionType,
     },
   };
 }
@@ -443,7 +454,55 @@ function findPluginDirs(root, maxDepth = 4) {
  * state, not package content, so a clean re-install must carry them across
  * instead of letting the incoming package wipe them.
  */
-const PRESERVED_INSTALL_FILES = ['.enabled'];
+const PRESERVED_INSTALL_FILES = ['.enabled', INSTALL_ID_SENTINEL_FILE];
+
+/**
+ * Turn an npm package name into a filesystem/id-safe string. npm already
+ * guarantees package names are globally unique, so deriving the extension id
+ * from the package name is collision-safe without asking the author to
+ * hand-pick a short id — *if* the encoding itself can't collide.
+ *
+ * Unscoped names pass through unchanged: "finch-anydoc" → "finch-anydoc".
+ * Scoped names join scope and name with `@`, not `-`:
+ * "@finchtoys/mcp-client" → "finchtoys@mcp-client". This specifically matters
+ * for forgery-resistance: npm's naming rules only allow `@` as the very first
+ * character of a scoped package's scope, so no *unscoped* package can ever be
+ * published with a literal "@" in its name. That means "finchtoys@mcp-client"
+ * can only ever come from `@finchtoys/mcp-client` — an attacker can't publish
+ * an unscoped package named "finchtoys-mcp-client" to squat on / spoof the id
+ * a scoped package would otherwise resolve to (which `-` as the join
+ * character would allow).
+ */
+function sanitizeExtensionId(packageName) {
+  const trimmed = String(packageName).trim();
+  const scoped = /^@([^/]+)\/(.+)$/.exec(trimmed);
+  if (scoped) {
+    const scope = scoped[1].replace(/[^a-zA-Z0-9._-]/g, '-');
+    const name = scoped[2].replace(/[^a-zA-Z0-9._-]/g, '-');
+    return `${scope}@${name}`;
+  }
+  return trimmed.replace(/[^a-zA-Z0-9._-]/g, '-');
+}
+
+/**
+ * Guard against one npm package silently overwriting an extension id that
+ * already belongs to a different package — the same protection
+ * `assertCompatibleExtensionIdentity` provides for the GUI local-install path
+ * (src/main/services/extension/identity.ts), mirrored here because `add`/
+ * `update` never went through that check. Package ownership itself is
+ * delegated to the npm registry; this only stops a *different* package from
+ * silently taking over an id that another package's install already owns.
+ */
+function assertCompatibleInstallIdentity(dest, id, incomingPackageName) {
+  if (!existsSync(dest)) return;
+  const existingPkg = readPackageJson(dest);
+  const existingName = (existingPkg?.name ?? '').trim().toLowerCase();
+  const incomingName = (incomingPackageName ?? '').trim().toLowerCase();
+  if (!existingName || !incomingName || existingName === incomingName) return;
+  throw new Error(
+    `扩展 ID "${id}" 已属于 npm 包 "${existingPkg?.name ?? 'unknown'}"，不能由 "${incomingPackageName ?? 'unknown'}" 覆盖`,
+  );
+}
 
 /**
  * Replace `dest` with `srcDir`, rather than merging on top of it.
@@ -468,20 +527,46 @@ function replaceExtensionDir(srcDir, dest) {
   }
 }
 
-function installExtensionDir(srcDir, destRoot, lockSource, { quiet = false } = {}) {
+/**
+ * @param {object} [options]
+ * @param {boolean} [options.quiet]
+ * @param {string} [options.pinnedId] Keep installing into this exact existing
+ *   id/directory instead of deriving a (possibly different) id from the
+ *   incoming package name. `update` passes the id it was asked to update so a
+ *   re-fetched package never gets silently moved to a new directory mid-update
+ *   — id derivation from the package name only ever applies to a fresh `add`.
+ */
+function installExtensionDir(srcDir, destRoot, lockSource, { quiet = false, pinnedId } = {}) {
   const info = pluginInfo(srcDir);
   if (!info) throw new Error(`不是 Finch 扩展: ${srcDir}`);
   if (info.error) throw new Error(info.error);
+  const pkg = readPackageJson(srcDir);
+  // Prefer the npm package name over the author-declared `finch.id`: package
+  // names are globally unique (npm-enforced), a freeform id string is not,
+  // and two unrelated extensions picking the same short id would silently
+  // collide. Unscoped names pass through as-is ("finch-anydoc" stays
+  // "finch-anydoc"); scoped names fold the scope in with `@`, not `-`
+  // ("@finchtoys/mcp-client" → "finchtoys@mcp-client" — see
+  // sanitizeExtensionId for why `@` resists spoofing). Applies uniformly,
+  // official packages included — bundled official extensions never reach this
+  // function (installBundledExtensions copies them directly and keeps their
+  // curated "mcp"/"git-branch" id), so this only matters if someone manually
+  // `add`s an official npm package instead of relying on the bundled deploy;
+  // see INSTALL_ID_SENTINEL_FILE for why this only affects installs going
+  // through this function in the first place.
+  const resolvedId = pinnedId ?? (pkg?.name ? sanitizeExtensionId(pkg.name) : info.id);
   mkdirSync(destRoot, { recursive: true });
-  const dest = join(destRoot, info.id);
+  const dest = join(destRoot, resolvedId);
+  assertCompatibleInstallIdentity(dest, resolvedId, pkg?.name);
   replaceExtensionDir(srcDir, dest);
-  recordInstall(destRoot, info.id, lockSource);
+  try { writeFileSync(join(dest, INSTALL_ID_SENTINEL_FILE), resolvedId, 'utf-8'); } catch { /* best effort */ }
+  recordInstall(destRoot, resolvedId, lockSource);
   // `update` reports its own before/after summary, so stay quiet there rather
   // than telling the user to go enable an extension they already enabled.
-  if (quiet) return info.id;
-  console.log(`✓ Added "${info.displayName}" (${info.id}) → ${dest}`);
+  if (quiet) return resolvedId;
+  console.log(`✓ Added "${info.displayName}" (${resolvedId}) → ${dest}`);
   console.log('  Installed only. Open Finch → Toolcase → Mini Tools to review permissions and enable.');
-  return info.id;
+  return resolvedId;
 }
 
 function isLocalSource(src) {
@@ -688,7 +773,7 @@ async function resolveNpmTarball(spec) {
  * Install extensions from a zip file (local path or remote URL).
  * The zip may contain one or more extensions at any nesting level.
  */
-async function installFromZip(src, dest, isUrl, { quiet = false } = {}) {
+async function installFromZip(src, dest, isUrl, { quiet = false, pinnedId } = {}) {
   const tmp = join(tmpdir(), `finch-ext-${randomUUID()}`);
   const zipPath = join(tmp, 'extension.zip');
   const extractDir = join(tmp, 'extracted');
@@ -713,13 +798,16 @@ async function installFromZip(src, dest, isUrl, { quiet = false } = {}) {
     const lockSource = isUrl
       ? { type: 'zip', url: src }
       : { type: 'zip', localPath: resolve(expandHome(src)) };
-    for (const dir of found) installExtensionDir(dir, dest, lockSource, { quiet });
+    // pinnedId only makes sense when the archive resolves to exactly the one
+    // extension being updated; a multi-extension archive derives ids normally.
+    const idOverride = found.length === 1 ? pinnedId : undefined;
+    for (const dir of found) installExtensionDir(dir, dest, lockSource, { quiet, pinnedId: idOverride });
   } finally {
     try { rmSync(tmp, { recursive: true, force: true }); } catch { /* ignore */ }
   }
 }
 
-async function installFromTgz(src, dest, { isUrl, lockSource, quiet = false }) {
+async function installFromTgz(src, dest, { isUrl, lockSource, quiet = false, pinnedId }) {
   const tmp = join(tmpdir(), `finch-ext-${randomUUID()}`);
   const tgzPath = join(tmp, 'extension.tgz');
   const extractDir = join(tmp, 'extracted');
@@ -743,7 +831,8 @@ async function installFromTgz(src, dest, { isUrl, lockSource, quiet = false }) {
     const source = lockSource ?? (isUrl
       ? { type: 'tgz', url: src }
       : { type: 'tgz', localPath: resolve(expandHome(src)) });
-    for (const dir of found) installExtensionDir(dir, dest, source, { quiet });
+    const idOverride = found.length === 1 ? pinnedId : undefined;
+    for (const dir of found) installExtensionDir(dir, dest, source, { quiet, pinnedId: idOverride });
   } finally {
     try { rmSync(tmp, { recursive: true, force: true }); } catch { /* ignore */ }
   }
@@ -1084,18 +1173,19 @@ async function cmdUpdate(id, opts) {
     replaceExtensionDir(plan.localPath, target);
     recordInstall(dir, id, plan.source);
   } else if (plan.kind === 'zip') {
-    if (plan.source.url) await installFromZip(plan.source.url, dir, true, { quiet: true });
-    else if (plan.source.localPath) await installFromZip(plan.source.localPath, dir, false, { quiet: true });
+    if (plan.source.url) await installFromZip(plan.source.url, dir, true, { quiet: true, pinnedId: id });
+    else if (plan.source.localPath) await installFromZip(plan.source.localPath, dir, false, { quiet: true, pinnedId: id });
     else throw new Error(`zip install record for "${id}" has no url or localPath; reinstall with \`add\`.`);
   } else if (plan.kind === 'tgz') {
-    if (plan.source.url) await installFromTgz(plan.source.url, dir, { isUrl: true, lockSource: plan.source, quiet: true });
-    else if (plan.source.localPath) await installFromTgz(plan.source.localPath, dir, { isUrl: false, lockSource: plan.source, quiet: true });
+    if (plan.source.url) await installFromTgz(plan.source.url, dir, { isUrl: true, lockSource: plan.source, quiet: true, pinnedId: id });
+    else if (plan.source.localPath) await installFromTgz(plan.source.localPath, dir, { isUrl: false, lockSource: plan.source, quiet: true, pinnedId: id });
     else throw new Error(`tgz install record for "${id}" has no url or localPath; reinstall with \`add\`.`);
   } else {
     await installFromTgz(plan.candidate.tarball, dir, {
       isUrl: true,
       lockSource: { type: 'npm', package: plan.candidate.package, version: plan.candidate.version },
       quiet: true,
+      pinnedId: id,
     });
   }
 
