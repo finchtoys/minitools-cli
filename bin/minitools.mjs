@@ -6,7 +6,7 @@
  * dist.tarball (.tgz) directly, so third-party install scripts never run.
  */
 import {
-  existsSync, mkdirSync, readdirSync, cpSync, rmSync,
+  existsSync, mkdirSync, readdirSync, cpSync, rmSync, statSync,
   readFileSync, writeFileSync,
 } from 'node:fs';
 import { isAbsolute, join, resolve, basename } from 'node:path';
@@ -74,6 +74,9 @@ function pluginsStatePath() {
 }
 function miniToolCacheDir() {
   return join(finchRuntimeHome(), 'cache', 'minitools');
+}
+function extensionDataDir(id) {
+  return join(finchRuntimeHome(), 'extension-data', id);
 }
 function lockPath(dir) {
   return join(dir, LOCK_FILE);
@@ -527,6 +530,42 @@ function replaceExtensionDir(srcDir, dest) {
   }
 }
 
+function copyMissing(source, target) {
+  if (!existsSync(target)) {
+    mkdirSync(join(target, '..'), { recursive: true });
+    cpSync(source, target, { recursive: true, force: false, dereference: false });
+    return;
+  }
+  if (!statSync(source).isDirectory() || !statSync(target).isDirectory()) return;
+  const entries = readdirSync(source, { withFileTypes: true });
+  for (const entry of entries) {
+    if (!entry.isDirectory() && existsSync(join(target, entry.name))) continue;
+    copyMissing(join(source, entry.name), join(target, entry.name));
+  }
+}
+
+function migrateExtensionData(legacyId, canonicalId) {
+  if (legacyId === canonicalId) return;
+  const legacy = extensionDataDir(legacyId);
+  if (!existsSync(legacy)) return;
+  copyMissing(legacy, extensionDataDir(canonicalId));
+  rmSync(legacy, { recursive: true, force: true });
+}
+
+function migrateExtensionState(legacyId, canonicalId) {
+  if (legacyId === canonicalId) return;
+  const path = pluginsStatePath();
+  const raw = readJson(path, {});
+  const extensions = normalizePluginState(raw);
+  if (extensions[legacyId] && !extensions[canonicalId]) extensions[canonicalId] = extensions[legacyId];
+  delete extensions[legacyId];
+  const enabled = Object.entries(extensions)
+    .filter(([, record]) => record.enabled)
+    .map(([extensionId]) => extensionId)
+    .sort();
+  writeJson(path, { ...raw, enabled, extensions });
+}
+
 /**
  * @param {object} [options]
  * @param {boolean} [options.quiet]
@@ -923,11 +962,14 @@ function cmdRemove(id, opts) {
 
 function normalizePluginState(raw) {
   const plugins = {};
-  if (raw?.plugins && typeof raw.plugins === 'object') {
-    for (const [id, record] of Object.entries(raw.plugins)) {
-      if (!record || typeof record !== 'object') continue;
-      plugins[id] = { ...record, enabled: record.enabled === true };
-    }
+  const records = raw?.extensions && typeof raw.extensions === 'object'
+    ? raw.extensions
+    : raw?.plugins && typeof raw.plugins === 'object'
+      ? raw.plugins
+      : {};
+  for (const [id, record] of Object.entries(records)) {
+    if (!record || typeof record !== 'object') continue;
+    plugins[id] = { ...record, enabled: record.enabled === true };
   }
   if (Array.isArray(raw?.enabled)) {
     for (const id of raw.enabled) {
@@ -939,13 +981,14 @@ function normalizePluginState(raw) {
 
 function setEnabled(id, enabled) {
   const path = pluginsStatePath();
-  const plugins = normalizePluginState(readJson(path, {}));
-  plugins[id] = { ...(plugins[id] ?? {}), enabled };
-  const enabledIds = Object.entries(plugins)
+  const raw = readJson(path, {});
+  const extensions = normalizePluginState(raw);
+  extensions[id] = { ...(extensions[id] ?? {}), enabled };
+  const enabledIds = Object.entries(extensions)
     .filter(([, record]) => record.enabled)
     .map(([extensionId]) => extensionId)
     .sort();
-  writeJson(path, { enabled: enabledIds, plugins });
+  writeJson(path, { ...raw, enabled: enabledIds, extensions });
 }
 
 function cmdEnable(id, enabled) {
@@ -1162,43 +1205,55 @@ async function resolveUpdateSource(id, dir, target, recorded) {
 
 async function cmdUpdate(id, opts) {
   const dir = targetDir(opts);
-  const target = join(dir, id);
-  if (!existsSync(target)) throw new Error(`extension not found: ${id}`);
+  const legacyTarget = join(dir, id);
+  if (!existsSync(legacyTarget)) throw new Error(`extension not found: ${id}`);
 
-  const before = installedVersionOf(target);
+  const packageName = npmPackageNameOf(legacyTarget);
+  const canonicalId = packageName ? sanitizeExtensionId(packageName) : id;
+  const target = join(dir, canonicalId);
+  const before = installedVersionOf(legacyTarget);
   const recorded = normalizeInstallSource(readLock(dir)[id]);
-  const plan = await resolveUpdateSource(id, dir, target, recorded);
+  const plan = await resolveUpdateSource(id, dir, legacyTarget, recorded);
 
   if (plan.kind === 'local') {
     replaceExtensionDir(plan.localPath, target);
-    recordInstall(dir, id, plan.source);
+    try { writeFileSync(join(target, INSTALL_ID_SENTINEL_FILE), canonicalId, 'utf-8'); } catch { /* best effort */ }
+    recordInstall(dir, canonicalId, plan.source);
   } else if (plan.kind === 'zip') {
-    if (plan.source.url) await installFromZip(plan.source.url, dir, true, { quiet: true, pinnedId: id });
-    else if (plan.source.localPath) await installFromZip(plan.source.localPath, dir, false, { quiet: true, pinnedId: id });
+    if (plan.source.url) await installFromZip(plan.source.url, dir, true, { quiet: true, pinnedId: canonicalId });
+    else if (plan.source.localPath) await installFromZip(plan.source.localPath, dir, false, { quiet: true, pinnedId: canonicalId });
     else throw new Error(`zip install record for "${id}" has no url or localPath; reinstall with \`add\`.`);
   } else if (plan.kind === 'tgz') {
-    if (plan.source.url) await installFromTgz(plan.source.url, dir, { isUrl: true, lockSource: plan.source, quiet: true, pinnedId: id });
-    else if (plan.source.localPath) await installFromTgz(plan.source.localPath, dir, { isUrl: false, lockSource: plan.source, quiet: true, pinnedId: id });
+    if (plan.source.url) await installFromTgz(plan.source.url, dir, { isUrl: true, lockSource: plan.source, quiet: true, pinnedId: canonicalId });
+    else if (plan.source.localPath) await installFromTgz(plan.source.localPath, dir, { isUrl: false, lockSource: plan.source, quiet: true, pinnedId: canonicalId });
     else throw new Error(`tgz install record for "${id}" has no url or localPath; reinstall with \`add\`.`);
   } else {
     await installFromTgz(plan.candidate.tarball, dir, {
       isUrl: true,
       lockSource: { type: 'npm', package: plan.candidate.package, version: plan.candidate.version },
       quiet: true,
-      pinnedId: id,
+      pinnedId: canonicalId,
     });
+  }
+
+  if (canonicalId !== id) {
+    migrateExtensionData(id, canonicalId);
+    migrateExtensionState(id, canonicalId);
+    deleteRecord(dir, id);
+    rmSync(legacyTarget, { recursive: true, force: true });
   }
 
   // Report what actually landed on disk. Exit code 0 alone used to be read as
   // "updated", which is how a no-op copy became a success toast in Finch.
   const after = installedVersionOf(target);
   const info = pluginInfo(target);
-  const displayName = (info && !info.error && info.displayName) || id;
+  const displayName = (info && !info.error && info.displayName) || canonicalId;
   const changed = Boolean(before && after && compareSemver(after, before) !== 0);
-  if (changed) console.log(`✓ Updated "${displayName}" (${id}) v${before} → v${after}`);
-  else console.log(`• "${displayName}" (${id}) is already up to date (v${after ?? before ?? 'unknown'})`);
+  if (changed) console.log(`✓ Updated "${displayName}" (${canonicalId}) v${before} → v${after}`);
+  else console.log(`• "${displayName}" (${canonicalId}) is already up to date (v${after ?? before ?? 'unknown'})`);
   console.log(`FINCH_CLI_RESULT_JSON:${JSON.stringify({
-    id,
+    id: canonicalId,
+    previousId: canonicalId === id ? undefined : id,
     changed,
     previousVersion: before,
     version: after,
