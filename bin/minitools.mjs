@@ -115,7 +115,7 @@ function readPackageJson(dir) {
 function localizedValue(value, fallback = '') {
   if (typeof value === 'string') return value;
   if (value && typeof value === 'object') {
-    return value.default ?? value['en-US'] ?? value['zh-CN'] ?? fallback;
+    return value.default ?? value['en-US'] ?? value['zh-CN'] ?? value['zh-HK'] ?? fallback;
   }
   return fallback;
 }
