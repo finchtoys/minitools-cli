@@ -164,6 +164,14 @@ function validateContributes(contributes, diagnostics) {
   if (contributes.skills != null && typeof contributes.skills !== 'boolean') {
     diagnostics.warning.push('finch.contributes.skills 应为 boolean');
   }
+  if (contributes.settingsMenu != null) {
+    if (!validateObject(contributes.settingsMenu, 'finch.contributes.settingsMenu', diagnostics)) {
+      diagnostics.fatal.push('finch.contributes.settingsMenu 必须是对象');
+    } else {
+      validateStringField(contributes.settingsMenu.icon, 'finch.contributes.settingsMenu.icon', diagnostics);
+      validateStringField(contributes.settingsMenu.tooltip, 'finch.contributes.settingsMenu.tooltip', diagnostics, { localized: true });
+    }
+  }
   if (contributes.composerActions != null) {
     if (!Array.isArray(contributes.composerActions)) {
       diagnostics.fatal.push('finch.contributes.composerActions 必须是数组');
@@ -290,7 +298,19 @@ function validatePermissions(permissions, diagnostics) {
   if (permissions.sessions != null && typeof permissions.sessions !== 'boolean') {
     diagnostics.warning.push('finch.permissions.sessions 应为 boolean');
   }
+  if (permissions.sessionInteractions != null && typeof permissions.sessionInteractions !== 'boolean') {
+    diagnostics.warning.push('finch.permissions.sessionInteractions 应为 boolean');
+  }
   validateStringArray(permissions.secrets, 'finch.permissions.secrets', diagnostics);
+  if (Array.isArray(permissions.secrets)) {
+    for (const key of permissions.secrets) {
+      if (typeof key !== 'string' || !key.trim()) continue;
+      const wildcardIndex = key.indexOf('*');
+      if (wildcardIndex >= 0 && (key === '*' || !key.endsWith('.*') || wildcardIndex !== key.length - 1)) {
+        diagnostics.fatal.push(`finch.permissions.secrets 不支持密钥模式 ${JSON.stringify(key)}；仅允许精确 key 或末尾 .* 前缀`);
+      }
+    }
+  }
   validateStringArray(permissions.oauth, 'finch.permissions.oauth', diagnostics);
 }
 
@@ -364,6 +384,11 @@ function validateMiniToolPackage(dir, { lintSource = false } = {}) {
   validateStringField(manifest.description, 'finch.description', diagnostics, { localized: true });
   validateStringField(manifest.systemPrompt, 'finch.systemPrompt', diagnostics, { localized: true });
   validateStringArray(manifest.categories, 'finch.categories', diagnostics);
+  validateStringField(manifest.privacyPolicyUrl, 'finch.privacyPolicyUrl', diagnostics);
+  validateStringField(manifest.termsOfServiceUrl, 'finch.termsOfServiceUrl', diagnostics);
+  if (manifest.autoEnable != null && typeof manifest.autoEnable !== 'boolean') {
+    diagnostics.warning.push('finch.autoEnable 应为 boolean');
+  }
 
   const extensionType = manifest.miniToolType ?? manifest.extensionType;
   if (extensionType != null && (typeof extensionType !== 'string' || !extensionType.trim())) {
