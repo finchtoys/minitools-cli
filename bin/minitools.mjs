@@ -7,9 +7,9 @@
  */
 import {
   existsSync, mkdirSync, readdirSync, cpSync, rmSync, statSync,
-  readFileSync, writeFileSync,
+  lstatSync, readFileSync, symlinkSync, writeFileSync,
 } from 'node:fs';
-import { isAbsolute, join, resolve, basename } from 'node:path';
+import { isAbsolute, join, resolve, basename, relative } from 'node:path';
 import { homedir, tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
@@ -104,6 +104,21 @@ function deleteRecord(dir, id) {
   const lock = readLock(dir);
   delete lock[id];
   writeLock(dir, lock);
+}
+function pathEntryExists(path) {
+  try {
+    lstatSync(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+function isSymbolicLink(path) {
+  try {
+    return lstatSync(path).isSymbolicLink();
+  } catch {
+    return false;
+  }
 }
 
 function readPackageJson(dir) {
@@ -633,6 +648,38 @@ function installExtensionDir(srcDir, destRoot, lockSource, { quiet = false, pinn
   return resolvedId;
 }
 
+function pathsOverlap(a, b) {
+  const aToB = relative(a, b);
+  const bToA = relative(b, a);
+  const contains = (value) => value === '' || (!value.startsWith('..') && !isAbsolute(value));
+  return contains(aToB) || contains(bToA);
+}
+
+function linkExtensionDir(srcDir, destRoot) {
+  const info = pluginInfo(srcDir);
+  if (!info) throw new Error(`不是 Finch 扩展: ${srcDir}`);
+  if (info.error) throw new Error(info.error);
+  const pkg = readPackageJson(srcDir);
+  const resolvedId = pkg?.name ? sanitizeExtensionId(pkg.name) : info.id;
+  mkdirSync(destRoot, { recursive: true });
+  const dest = join(destRoot, resolvedId);
+  if (pathsOverlap(srcDir, dest)) {
+    throw new Error('开发源目录不能位于目标安装目录内，也不能与目标目录相同');
+  }
+  if (existsSync(dest)) assertCompatibleInstallIdentity(dest, resolvedId, pkg?.name);
+  if (pathEntryExists(dest)) rmSync(dest, { recursive: true, force: true });
+  symlinkSync(srcDir, dest, process.platform === 'win32' ? 'junction' : 'dir');
+  recordInstall(destRoot, resolvedId, {
+    type: 'dev',
+    mode: 'development',
+    linked: true,
+    localPath: srcDir,
+  });
+  console.log(`✓ Linked "${info.displayName}" (${resolvedId}) → ${srcDir}`);
+  console.log('  Development install: source changes are used directly; update will not overwrite this link.');
+  return resolvedId;
+}
+
 function isLocalSource(src) {
   return src.startsWith('./') || src.startsWith('../') || src.startsWith('/') || src.startsWith('~') || /^[a-zA-Z]:[\\/]/.test(src);
 }
@@ -904,6 +951,9 @@ async function installFromTgz(src, dest, { isUrl, lockSource, quiet = false, pin
 
 async function cmdAdd(src, opts) {
   const dest = targetDir(opts);
+  if (opts.dev && !isLocalSource(src)) {
+    throw new Error('-d/--dev only supports a local extension directory');
+  }
 
   // --- archive URL (e.g. https://github.com/.../archive/main.zip or npm tarball .tgz) ---
   if (isZipUrl(src)) {
@@ -922,18 +972,22 @@ async function cmdAdd(src, opts) {
 
     // Local archive file
     if (isZipFile(src)) {
+      if (opts.dev) throw new Error('-d/--dev requires a directory, not an archive');
       await installFromZip(src, dest, false);
       return;
     }
     if (isTgzFile(src)) {
+      if (opts.dev) throw new Error('-d/--dev requires a directory, not an archive');
       await installFromTgz(src, dest, { isUrl: false });
       return;
     }
+    if (!statSync(abs).isDirectory()) throw new Error(`not a directory: ${abs}`);
 
     // Local directory
     const direct = pluginInfo(abs);
     if (direct && !direct.error) {
-      installExtensionDir(abs, dest, { type: 'local', localPath: abs });
+      if (opts.dev) linkExtensionDir(abs, dest);
+      else installExtensionDir(abs, dest, { type: 'local', localPath: abs });
       return;
     }
     const found = findPluginDirs(abs, 3);
@@ -941,7 +995,10 @@ async function cmdAdd(src, opts) {
       if (found.invalid?.length) throw new Error(`Invalid Finch extension in the given directory: ${found.invalid[0].error}`);
       throw new Error('No Finch extension found in the given directory.');
     }
-    for (const dir of found) installExtensionDir(dir, dest, { type: 'local', localPath: dir });
+    for (const dir of found) {
+      if (opts.dev) linkExtensionDir(dir, dest);
+      else installExtensionDir(dir, dest, { type: 'local', localPath: dir });
+    }
     return;
   }
 
@@ -956,9 +1013,14 @@ async function cmdAdd(src, opts) {
 function listInstalled(dir) {
   if (!existsSync(dir)) return [];
   return readdirSync(dir, { withFileTypes: true })
-    .filter((e) => e.isDirectory())
-    .map((e) => ({ dir: e.name, path: join(dir, e.name), info: pluginInfo(join(dir, e.name)) }))
-    .filter((x) => x.info && !x.info.error);
+    .filter((e) => e.isDirectory() || e.isSymbolicLink())
+    .map((e) => {
+      const path = join(dir, e.name);
+      const linked = e.isSymbolicLink();
+      const info = existsSync(path) ? pluginInfo(path) : null;
+      return { dir: e.name, path, linked, info };
+    })
+    .filter((x) => x.linked || (x.info && !x.info.error));
 }
 
 function cmdList(opts) {
@@ -970,15 +1032,20 @@ function cmdList(opts) {
   }
   const pluginState = normalizePluginState(readJson(pluginsStatePath(), {}));
   for (const p of plugins) {
-    const status = pluginState[p.info.id]?.enabled ? 'enabled' : 'disabled';
-    console.log(`${p.info.id}\t${p.info.version}\t${status}\t${p.info.displayName}\t${p.path}`);
+    if (!p.info || p.info.error) {
+      console.log(`${p.dir}\tunknown\tlinked-broken\t${p.dir}\t${p.path}`);
+      continue;
+    }
+    const status = pluginState[p.dir]?.enabled ? 'enabled' : 'disabled';
+    const installStatus = p.linked ? `${status},linked` : status;
+    console.log(`${p.dir}\t${p.info.version}\t${installStatus}\t${p.info.displayName}\t${p.path}`);
   }
 }
 
 function cmdRemove(id, opts) {
   const dir = targetDir(opts);
   const target = join(dir, id);
-  if (!existsSync(target)) throw new Error(`extension not found: ${id}`);
+  if (!pathEntryExists(target)) throw new Error(`extension not found: ${id}`);
   rmSync(target, { recursive: true, force: true });
   deleteRecord(dir, id);
   setEnabled(id, false);
@@ -1231,13 +1298,17 @@ async function resolveUpdateSource(id, dir, target, recorded) {
 async function cmdUpdate(id, opts) {
   const dir = targetDir(opts);
   const legacyTarget = join(dir, id);
-  if (!existsSync(legacyTarget)) throw new Error(`extension not found: ${id}`);
+  if (!pathEntryExists(legacyTarget)) throw new Error(`extension not found: ${id}`);
+  const recorded = normalizeInstallSource(readLock(dir)[id]);
+  if (isSymbolicLink(legacyTarget) || recorded?.type === 'dev' || recorded?.linked) {
+    throw new Error(`"${id}" is a development link and cannot be updated; edit or build the source directory instead.`);
+  }
+  if (!existsSync(legacyTarget)) throw new Error(`extension source is unavailable: ${id}`);
 
   const packageName = npmPackageNameOf(legacyTarget);
   const canonicalId = packageName ? sanitizeExtensionId(packageName) : id;
   const target = join(dir, canonicalId);
   const before = installedVersionOf(legacyTarget);
-  const recorded = normalizeInstallSource(readLock(dir)[id]);
   const plan = await resolveUpdateSource(id, dir, legacyTarget, recorded);
 
   if (plan.kind === 'local') {
@@ -1289,11 +1360,12 @@ async function cmdUpdate(id, opts) {
 function parseArgs(argv) {
   const args = [...argv];
   const cmd = args.shift();
-  const opts = { global: false, registry: null };
+  const opts = { global: false, dev: false, registry: null };
   const rest = [];
   for (let i = 0; i < args.length; i += 1) {
     const a = args[i];
     if (a === '--global' || a === '-g') opts.global = true;
+    else if (a === '--dev' || a === '-d') opts.dev = true;
     else if (a === '--registry') {
       const value = args[i + 1];
       if (!value || value.startsWith('--')) throw new Error('--registry requires a URL');
@@ -1310,7 +1382,7 @@ function parseArgs(argv) {
 }
 
 function help() {
-  console.log(`npx @finchtoys/minitools\n\nUsage:\n  add <npm-package|local-path|url.zip|url.tgz> [--global] [--registry <url>]\n  update <id> [--global] [--registry <url>]\n  list [--global]\n  remove <id> [--global]\n  enable <id>\n  disable <id>\n  where\n  doctor [path]\n\nInstall locations:\n  default     workspace.json#finchHomeDir/.finch/extensions/  (personal — default)\n  --global   FINCH_RUNTIME_HOME/extensions/                    (global; default ~/.finch/extensions/)\n\nRegistry:\n  --registry <url> overrides npm registry for npm package metadata/tarball downloads.\n  If omitted, npm_config_registry is used, then https://registry.npmjs.org.\n\nThere is no project/--cwd scope — extensions only install to personal or global.\n`);
+  console.log(`npx @finchtoys/minitools\n\nUsage:\n  add <npm-package|local-path|url.zip|url.tgz> [--global] [--registry <url>]\n  add <local-directory> -d|--dev [--global]\n  update <id> [--global] [--registry <url>]\n  list [--global]\n  remove <id> [--global]\n  enable <id>\n  disable <id>\n  where\n  doctor [path]\n\nDevelopment install:\n  -d, --dev creates a directory symlink instead of copying the local mini tool.\n  Linked mini tools are not overwritten by update; remove deletes only the link.\n\nInstall locations:\n  default     workspace.json#finchHomeDir/.finch/extensions/  (personal — default)\n  --global   FINCH_RUNTIME_HOME/extensions/                    (global; default ~/.finch/extensions/)\n\nRegistry:\n  --registry <url> overrides npm registry for npm package metadata/tarball downloads.\n  If omitted, npm_config_registry is used, then https://registry.npmjs.org.\n\nThere is no project/--cwd scope — extensions only install to personal or global.\n`);
 }
 
 (async () => {
@@ -1318,6 +1390,7 @@ function help() {
     const { cmd, rest, opts } = parseArgs(process.argv.slice(2));
     registryOverride = opts.registry;
     if (!cmd || cmd === 'help' || cmd === '--help' || cmd === '-h') return help();
+    if (opts.dev && cmd !== 'add') throw new Error('-d/--dev is only supported by add');
     if (cmd === 'add') {
       if (!rest[0]) throw new Error('missing source');
       await cmdAdd(rest[0], opts);
