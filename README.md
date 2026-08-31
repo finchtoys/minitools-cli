@@ -1,6 +1,6 @@
 # @finchtoys/minitools
 
-The official CLI for installing and managing Finch minitools.
+The official CLI for installing and managing Finch mini tools (shown in the app as Mini Programs).
 
 ## Installation
 
@@ -13,16 +13,16 @@ npx @finchtoys/minitools add <package>
 ## Usage
 
 ```bash
-# Install an mini tool from npm
+# Install a mini tool from npm
 npx @finchtoys/minitools add @scope/my-finch-tool
 
-# List installed mini tool extensions
+# List installed mini tools
 npx @finchtoys/minitools list
 
-# Update an mini tools
+# Update a mini tool
 npx @finchtoys/minitools update my-tool
 
-# Enable or disable an mini tool
+# Enable or disable a mini tool
 npx @finchtoys/minitools enable my-tool
 npx @finchtoys/minitools disable my-tool
 
@@ -38,7 +38,7 @@ npx @finchtoys/minitools doctor ./my-finch-tool
 
 When Finch launches the CLI, it supplies `FINCH_AGENT_HOME` and `FINCH_RUNTIME_HOME` so custom Agent homes and Dev/Prod runtimes remain isolated. Run `npx @finchtoys/minitools where` to inspect the resolved paths.
 
-Mini tools add agent tools, MCP integrations, and native UI capabilities to Finch. See the [Finch documentation](https://finchwork.app/en/docs/minitools) to build an mini tool (extension）.
+Mini tools add Agent tools, MCP integrations, and native UI capabilities to Finch. See the [Finch documentation](https://finchwork.app/en/docs/minitools) to build a mini tool.
 
 ## License
 
