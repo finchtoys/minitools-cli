@@ -584,6 +584,12 @@ function copyMissing(source, target) {
   }
 }
 
+function providesCapability(extensionDir, capability) {
+  const pkg = readPackageJson(extensionDir);
+  return Array.isArray(pkg?.finch?.provides?.capabilities)
+    && pkg.finch.provides.capabilities.includes(capability);
+}
+
 function migrateExtensionData(legacyId, canonicalId) {
   if (legacyId === canonicalId) return;
   const legacy = extensionDataDir(legacyId);
@@ -1333,7 +1339,11 @@ async function cmdUpdate(id, opts) {
   }
 
   if (canonicalId !== id) {
-    migrateExtensionData(id, canonicalId);
+    // MCP owns a semantic, multi-source migration. Keep both legacy data roots until
+    // the provider has merged configs, secrets and OAuth state into stable custody.
+    const preservesMcpHistory = providesCapability(legacyTarget, 'mcp.client')
+      || providesCapability(target, 'mcp.client');
+    if (!preservesMcpHistory) migrateExtensionData(id, canonicalId);
     migrateExtensionState(id, canonicalId);
     deleteRecord(dir, id);
     rmSync(legacyTarget, { recursive: true, force: true });
