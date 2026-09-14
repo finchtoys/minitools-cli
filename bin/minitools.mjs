@@ -605,11 +605,7 @@ function migrateExtensionState(legacyId, canonicalId) {
   const extensions = normalizePluginState(raw);
   if (extensions[legacyId] && !extensions[canonicalId]) extensions[canonicalId] = extensions[legacyId];
   delete extensions[legacyId];
-  const enabled = Object.entries(extensions)
-    .filter(([, record]) => record.enabled)
-    .map(([extensionId]) => extensionId)
-    .sort();
-  writeJson(path, { ...raw, enabled, extensions });
+  writeCurrentExtensionState(path, raw, extensions);
 }
 
 /**
@@ -1077,16 +1073,24 @@ function normalizePluginState(raw) {
   return plugins;
 }
 
+function writeCurrentExtensionState(path, raw, extensions) {
+  const state = raw && typeof raw === 'object' && !Array.isArray(raw) ? { ...raw } : {};
+  delete state.plugins;
+  state.enabled = Object.entries(extensions)
+    .filter(([, record]) => record.enabled)
+    .map(([extensionId]) => extensionId)
+    .sort();
+  state.extensions = extensions;
+  state.autoUpdate = raw?.autoUpdate === true;
+  writeJson(path, state);
+}
+
 function setEnabled(id, enabled) {
   const path = pluginsStatePath();
   const raw = readJson(path, {});
   const extensions = normalizePluginState(raw);
   extensions[id] = { ...(extensions[id] ?? {}), enabled };
-  const enabledIds = Object.entries(extensions)
-    .filter(([, record]) => record.enabled)
-    .map(([extensionId]) => extensionId)
-    .sort();
-  writeJson(path, { ...raw, enabled: enabledIds, extensions });
+  writeCurrentExtensionState(path, raw, extensions);
 }
 
 function cmdEnable(id, enabled) {
