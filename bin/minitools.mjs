@@ -298,35 +298,83 @@ function validateContributes(contributes, diagnostics) {
   }
 }
 
+/**
+ * Permission bits the Finch runtime actually understands, mirrored from
+ * `ExtensionPermissions` in src/shared/types.ts (and the published
+ * packages/minitool-api/finch.d.ts).
+ *
+ * Keep this table in sync whenever the runtime gains a permission: a doctor
+ * schema that lags behind the runtime reports valid manifests as broken. The
+ * tri-state scopes (`sessionInteractions` / `sessionWaits`) already support
+ * `boolean | 'all'`, so accepting only `boolean` mis-flags the exact manifests
+ * that need the global tier.
+ *
+ * `expect` values: 'boolean' | 'scoped' (boolean | 'all') | 'stringArray' |
+ * 'enum' | 'literal'.
+ */
+const PERMISSION_RULES = {
+  filesystem: { expect: 'enum', values: ['none', 'read', 'readwrite'], hint: '建议使用 none/read/readwrite' },
+  network: { expect: 'boolean' },
+  shell: { expect: 'boolean' },
+  agentEvents: { expect: 'literal', values: ['full'] },
+  secrets: { expect: 'stringArray' },
+  oauth: { expect: 'stringArray' },
+  artifacts: { expect: 'boolean' },
+  collaboration: { expect: 'boolean' },
+  sessions: { expect: 'boolean' },
+  sessionInteractions: { expect: 'scoped', hint: "应为 boolean 或 'all'（true = 仅自己拥有的会话，'all' = 任意会话）" },
+  destructiveInteractions: { expect: 'boolean' },
+  sessionWaits: { expect: 'scoped', hint: "应为 boolean 或 'all'（true = 仅自己拥有的会话，'all' = 全部会话）" },
+  appearance: { expect: 'boolean' },
+};
+
 function validatePermissions(permissions, diagnostics) {
   if (permissions == null) return;
   if (!validateObject(permissions, 'finch.permissions', diagnostics)) return;
-  if (permissions.filesystem != null && !['none', 'read', 'readwrite'].includes(permissions.filesystem)) {
-    diagnostics.warning.push('finch.permissions.filesystem 建议使用 none/read/readwrite');
-  }
-  if (permissions.network != null && typeof permissions.network !== 'boolean') {
-    diagnostics.warning.push('finch.permissions.network 应为 boolean');
-  }
-  if (permissions.shell != null && typeof permissions.shell !== 'boolean') {
-    diagnostics.warning.push('finch.permissions.shell 应为 boolean');
-  }
-  if (permissions.sessions != null && typeof permissions.sessions !== 'boolean') {
-    diagnostics.warning.push('finch.permissions.sessions 应为 boolean');
-  }
-  if (permissions.sessionInteractions != null && typeof permissions.sessionInteractions !== 'boolean') {
-    diagnostics.warning.push('finch.permissions.sessionInteractions 应为 boolean');
-  }
-  validateStringArray(permissions.secrets, 'finch.permissions.secrets', diagnostics);
-  if (Array.isArray(permissions.secrets)) {
-    for (const key of permissions.secrets) {
-      if (typeof key !== 'string' || !key.trim()) continue;
-      const wildcardIndex = key.indexOf('*');
-      if (wildcardIndex >= 0 && (key === '*' || !key.endsWith('.*') || wildcardIndex !== key.length - 1)) {
-        diagnostics.fatal.push(`finch.permissions.secrets 不支持密钥模式 ${JSON.stringify(key)}；仅允许精确 key 或末尾 .* 前缀`);
-      }
+  for (const [key, value] of Object.entries(permissions)) {
+    const field = `finch.permissions.${key}`;
+    const rule = PERMISSION_RULES[key];
+    if (!rule) {
+      const supported = Object.keys(PERMISSION_RULES).join(', ');
+      diagnostics.warning.push(`${field} 不是已知权限位（当前支持: ${supported}）；请检查拼写，若为更新版 Finch 的权限请先更新 CLI`);
+      continue;
+    }
+    if (value == null) continue;
+    switch (rule.expect) {
+      case 'boolean':
+        if (typeof value !== 'boolean') diagnostics.warning.push(`${field} 应为 boolean`);
+        break;
+      case 'literal':
+        if (typeof value !== 'string' || !rule.values.includes(value)) {
+          diagnostics.warning.push(`${field} 只能是 ${rule.values.map((v) => JSON.stringify(v)).join('/')}`);
+        }
+        break;
+      case 'enum':
+        if (typeof value !== 'string' || !rule.values.includes(value)) {
+          diagnostics.warning.push(`${field} ${rule.hint ?? `建议使用 ${rule.values.join('/')}`}`);
+        }
+        break;
+      case 'scoped':
+        if (typeof value !== 'boolean' && value !== 'all') {
+          diagnostics.warning.push(`${field} ${rule.hint ?? "应为 boolean 或 'all'"}`);
+        }
+        break;
+      case 'stringArray':
+        validateStringArray(value, field, diagnostics);
+        if (key === 'secrets' && Array.isArray(value)) {
+          for (const secretKey of value) {
+            if (typeof secretKey !== 'string' || !secretKey.trim()) continue;
+            const wildcardIndex = secretKey.indexOf('*');
+            if (wildcardIndex >= 0 && (secretKey === '*' || !secretKey.endsWith('.*') || wildcardIndex !== secretKey.length - 1)) {
+              diagnostics.fatal.push(`${field} 不支持密钥模式 ${JSON.stringify(secretKey)}；仅允许精确 key 或末尾 .* 前缀`);
+            }
+          }
+        }
+        break;
+      default:
+        break;
     }
   }
-  validateStringArray(permissions.oauth, 'finch.permissions.oauth', diagnostics);
 }
 
 function validateCapabilitySpec(spec, field, diagnostics) {
