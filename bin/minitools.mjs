@@ -629,11 +629,10 @@ function installExtensionDir(srcDir, destRoot, lockSource, { quiet = false, pinn
   // "finch-anydoc"); scoped names fold the scope in with `@`, not `-`
   // ("@finchtoys/mcp-client" → "finchtoys@mcp-client" — see
   // sanitizeExtensionId for why `@` resists spoofing). Applies uniformly,
-  // official packages included — bundled official extensions never reach this
-  // function (installBundledExtensions copies them directly and keeps their
-  // curated "mcp"/"git-branch" id), so this only matters if someone manually
-  // `add`s an official npm package instead of relying on the bundled deploy;
-  // see INSTALL_ID_SENTINEL_FILE for why this only affects installs going
+  // official packages included — `installBundledExtensions` derives the same
+  // id for bundled official extensions, so the app deploy and a manual `add`
+  // of the same package land in one directory instead of two.
+  // See INSTALL_ID_SENTINEL_FILE for why this only affects installs going
   // through this function in the first place.
   const resolvedId = pinnedId ?? (pkg?.name ? sanitizeExtensionId(pkg.name) : info.id);
   mkdirSync(destRoot, { recursive: true });
